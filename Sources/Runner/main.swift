@@ -3,7 +3,8 @@ import UserNotifications
 
 // Background helper (lives in the app bundle as AudioOutputSchedulerHelper.app, launched by launchd at each scheduled time).
 // Switches to the output that should be active now. If "wait until audio stops" is on and something
-// is playing, it waits and switches 3 s after playback stops. Posts a notification when it switches.
+// is playing, it waits and switches 3 s after playback stops. With the system-audio permission it
+// listens to the output level, so apps that only keep the device open don't count as playing. Posts a notification when it switches.
 
 setvbuf(stdout, nil, _IOLBF, 0)
 
@@ -61,12 +62,26 @@ func notify(_ title: String, _ body: String, force: Bool = false) {
 
 let args = CommandLine.arguments
 if args.contains("--authorize") { exit(authorize() ? 0 : 1) }
+CapturePermission.saveStatus()
 
 signal(SIGTERM) { _ in
     unlink(statusURL.path)
     exit(0)
 }
 
+let detector = PlaybackDetector()
+if args.contains("--check") {
+    // read-only: prints what the detector hears for a few seconds, without switching anything
+    let config = ConfigIO.load()
+    for _ in 0..<6 {
+        if let dev = Audio.defaultOutput() {
+            let apps = Audio.activeClients(on: dev, ignoring: config.ignoredApps).map(\.bundleID)
+            log("permission=\(CapturePermission.granted.map(String.init) ?? "unknown") open=\(apps) playing=\(detector.isPlaying(on: dev, ignoring: config.ignoredApps))")
+        }
+        Thread.sleep(forTimeInterval: 1)
+    }
+    exit(0)
+}
 var waiting = false
 var quietSince: Date?
 
@@ -83,7 +98,7 @@ while true {
         if waiting { log("\(target.device) is already the output; nothing to do.") }
         break
     }
-    if config.waitForSilence && Audio.isPlaying(on: cur, ignoring: config.ignoredApps) {
+    if config.waitForSilence && detector.isPlaying(on: cur, ignoring: config.ignoredApps) {
         quietSince = nil
         if !waiting { log("Audio is playing on \(Audio.name(cur)); waiting to switch to \(target.device).") }
         waiting = true
