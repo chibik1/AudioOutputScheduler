@@ -37,8 +37,13 @@ cp Resources/Info.plist "$APP/Contents/Info.plist"
 cp "$WORK/AudioOutputSchedulerHelper" "$HELPER/Contents/MacOS/"
 cp "$WORK/AppIcon.icns" "$HELPER/Contents/Resources/"
 cp Resources/HelperInfo.plist "$HELPER/Contents/Info.plist"
-codesign --force -s - "$HELPER"
-codesign --force -s - "$APP"
+# Ad-hoc signed by default. macOS ties the system-audio permission to this signature, so after
+# a rebuild remove and re-add "Audio Output Scheduler.app" under Privacy & Security > Screen &
+# System Audio Recording > System Audio Recording Only.
+SIGN_ID="${SIGN_ID:--}"
+echo "==> Signing ($SIGN_ID)"
+codesign --force -s "$SIGN_ID" "$HELPER"
+codesign --force -s "$SIGN_ID" "$APP"
 rm -rf "$WORK"
 echo "Built: $APP"
 

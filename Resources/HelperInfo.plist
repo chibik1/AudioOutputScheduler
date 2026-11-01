@@ -12,5 +12,6 @@
   <key>CFBundleVersion</key><string>1</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSUIElement</key><true/>
+  <key>NSAudioCaptureUsageDescription</key><string>Listens to the sound output level so that apps which only keep the audio device open, without making sound, don't delay a scheduled switch.</string>
 </dict>
 </plist>

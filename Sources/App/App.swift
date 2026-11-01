@@ -37,8 +37,37 @@ func resolveApp(_ bundle: String) -> AppInfo {
             }
         }
     }
+    if bundle.hasPrefix("com.apple.WebKit") {
+        return AppInfo(id: bundle, name: "Web content (WebKit)",
+                       icon: NSWorkspace.shared.icon(for: .html))
+    }
     return AppInfo(id: bundle, name: bundle.isEmpty ? "Unknown app" : bundle,
                    icon: NSWorkspace.shared.icon(for: .application))
+}
+
+/// The app a helper process (e.g. com.apple.WebKit.GPU) works for, via the private
+/// responsibility API. WebKit plays web audio from its own GPU process, so CoreAudio
+/// reports that process instead of the app showing the page.
+private let responsiblePID: (@convention(c) (pid_t) -> pid_t)? = {
+    guard let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "responsibility_get_pid_responsible_for_pid")
+    else { return nil }
+    return unsafeBitCast(sym, to: (@convention(c) (pid_t) -> pid_t).self)
+}()
+
+func ownerApp(of pid: pid_t) -> NSRunningApplication? {
+    guard let f = responsiblePID else { return nil }
+    let owner = f(pid)
+    guard owner > 0, owner != pid else { return nil }
+    return NSRunningApplication(processIdentifier: owner)
+}
+
+/// Shows WebKit helpers as the app(s) they play for: "MenubarX (Web)" with that app's icon.
+/// The id stays the WebKit bundle ID, since that is what the ignore list matches.
+func resolveWebKit(_ base: AppInfo, owners: [NSRunningApplication]) -> AppInfo {
+    let names = owners.compactMap(\.localizedName)
+    guard !names.isEmpty else { return base }
+    return AppInfo(id: base.id, name: names.joined(separator: ", ") + " (Web)",
+                   icon: owners.first?.icon ?? base.icon)
 }
 
 // MARK: - Store
@@ -50,8 +79,10 @@ final class Store: ObservableObject {
     @Published var pending: (time: String, device: String)?
     @Published var error: String?
     @Published var audioApps: [AppInfo] = []   // apps using the current output right now
-    let runnerPath = Bundle.main.bundleURL
-        .appendingPathComponent("Contents/Library/Helpers/AudioOutputSchedulerHelper.app/Contents/MacOS/AudioOutputSchedulerHelper").path
+    @Published var capture = "unknown"          // helper's system-audio permission: granted / denied / unknown
+    let helperURL = Bundle.main.bundleURL
+        .appendingPathComponent("Contents/Library/Helpers/AudioOutputSchedulerHelper.app")
+    var runnerPath: String { helperURL.appendingPathComponent("Contents/MacOS/AudioOutputSchedulerHelper").path }
     private var timer: Timer?
 
     init() {
@@ -70,6 +101,13 @@ final class Store: ObservableObject {
         config.notify = v
         save()
         if v { runHelper("--authorize") }
+    }
+    /// macOS doesn't show a permission prompt for the background helper, and it judges the helper by
+    /// the app that contains it, so the user adds this app by hand: opens Screen & System Audio
+    /// Recording and shows the app in Finder to drag into the list.
+    func allowCapture() {
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture")!)
+        NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
     }
     /// Lets the user pick any app to add to the ignore list.
     func addIgnoredApps() {
@@ -98,16 +136,27 @@ final class Store: ObservableObject {
         let parts = raw.split(separator: "\t", maxSplits: 1).map(String.init)
         let p = parts.count == 2 ? (time: parts[0], device: parts[1]) : nil
         if p?.time != pending?.time || p?.device != pending?.device { pending = p }
+        let cap = (try? String(contentsOf: captureStatusURL, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? "unknown"
+        if cap != capture { capture = cap }
         let c = Audio.currentOutputName()
         if c != current { current = c }
         var apps: [AppInfo] = []
+        var webOwners: [String: [NSRunningApplication]] = [:]
         if let dev = Audio.defaultOutput() {
             for client in Audio.outputClients(on: dev) {
                 let info = resolveApp(client.bundleID)
                 if !apps.contains(where: { $0.id == info.id }) { apps.append(info) }
+                if client.bundleID.hasPrefix("com.apple.WebKit"), let owner = ownerApp(of: client.pid),
+                   !(webOwners[info.id]?.contains(owner) ?? false) {
+                    webOwners[info.id, default: []].append(owner)
+                }
             }
         }
-        if apps.map(\.id) != audioApps.map(\.id) { audioApps = apps }
+        apps = apps.map { app in webOwners[app.id].map { resolveWebKit(app, owners: $0) } ?? app }
+        if apps.map(\.id) != audioApps.map(\.id) || apps.map(\.name) != audioApps.map(\.name) {
+            audioApps = apps
+        }
     }
     /// Apps shown in the ignore list: those using audio now plus those already ignored.
     var appRows: [AppInfo] {
@@ -337,6 +386,24 @@ struct ContentView: View {
                 .toggleStyle(.switch)
                 Text("If something is playing at the scheduled time, the output switches 3 seconds after playback stops.")
                     .font(.caption).foregroundStyle(.secondary)
+                if store.config.waitForSilence {
+                    if store.capture == "granted" {
+                        Label("Listens for actual sound, so apps that keep the output open while silent don't hold up the switch.",
+                              systemImage: "waveform")
+                            .font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        HStack(alignment: .firstTextBaseline) {
+                            Label(store.capture == "denied"
+                                  ? "System audio access is off, so any app with the output open counts as playing. Add Audio Output Scheduler under System Audio Recording Only."
+                                  : "Add Audio Output Scheduler under System Audio Recording Only to tell real sound from apps that only keep the output open.",
+                                  systemImage: "waveform.slash")
+                                .font(.caption).foregroundStyle(.orange)
+                            Spacer()
+                            Button("Open Settings…") { store.allowCapture() }
+                                .controlSize(.small)
+                        }
+                    }
+                }
             }
             if store.config.waitForSilence {
                 VStack(alignment: .leading, spacing: 6) {
@@ -346,7 +413,9 @@ struct ContentView: View {
                         Button { store.addIgnoredApps() } label: { Label("Add App…", systemImage: "plus") }
                             .controlSize(.small)
                     }
-                    Text("Some apps, like DAWs, keep the audio device open even when they are silent.")
+                    Text(store.capture == "granted"
+                         ? "Ignored apps never delay a switch, even while they make sound."
+                         : "Some apps, like DAWs, keep the audio device open even when they are silent.")
                         .font(.caption).foregroundStyle(.secondary)
                     ForEach(store.appRows) { app in
                         let using = store.audioApps.contains { $0.id == app.id }

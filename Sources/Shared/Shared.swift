@@ -5,6 +5,8 @@ let home = FileManager.default.homeDirectoryForCurrentUser
 let supportURL = home.appendingPathComponent("Library/Application Support/AudioOutputScheduler")
 let configURL = supportURL.appendingPathComponent("schedule.json")
 let statusURL = supportURL.appendingPathComponent("status.txt")
+/// Written by the helper: whether it may listen to output levels ("granted", "denied" or "unknown").
+let captureStatusURL = supportURL.appendingPathComponent("capture-permission.txt")
 let agentLabel = "io.github.chibik1.audiooutputscheduler"
 let agentURL = home.appendingPathComponent("Library/LaunchAgents/\(agentLabel).plist")
 
@@ -122,7 +124,7 @@ enum Audio {
         var dev = id
         return AudioObjectSetPropertyData(sys, &a, 0, nil, UInt32(MemoryLayout<AudioObjectID>.size), &dev) == noErr
     }
-    struct Client: Hashable { let pid: Int32; let bundleID: String }
+    struct Client: Hashable { let object: AudioObjectID; let pid: Int32; let bundleID: String }
     /// Apps that currently have audio output running on the given device.
     static func outputClients(on dev: AudioObjectID) -> [Client] {
         var a = addr(kAudioHardwarePropertyProcessObjectList)
@@ -150,14 +152,23 @@ enum Audio {
             var b: Unmanaged<CFString>?
             let bundle = AudioObjectGetPropertyData(p, &ba, 0, nil, &bs, &b) == noErr
                 ? (b?.takeRetainedValue() as String? ?? "") : ""
-            return Client(pid: pid, bundleID: bundle)
+            // the level meter's own tap shows up as a client; never count ourselves
+            guard !bundle.hasPrefix(agentLabel) else { return nil }
+            return Client(object: p, pid: pid, bundleID: bundle)
         }
     }
-    /// Something is playing on the device, not counting apps on the ignore list.
-    static func isPlaying(on dev: AudioObjectID, ignoring ignored: [String]) -> Bool {
-        outputClients(on: dev).contains { c in
+    /// Apps with audio running on the device, not counting apps on the ignore list.
+    static func activeClients(on dev: AudioObjectID, ignoring ignored: [String]) -> [Client] {
+        outputClients(on: dev).filter { c in
             !ignored.contains { !$0.isEmpty && c.bundleID.hasPrefix($0) }
         }
+    }
+    static func uid(_ id: AudioObjectID) -> String? {
+        var a = addr(kAudioDevicePropertyDeviceUID)
+        var size = UInt32(MemoryLayout<CFString?>.size)
+        var v: Unmanaged<CFString>?
+        guard AudioObjectGetPropertyData(id, &a, 0, nil, &size, &v) == noErr else { return nil }
+        return v?.takeRetainedValue() as String?
     }
     /// true while any app has audio running on the device
     static func isRunningSomewhere(_ id: AudioObjectID) -> Bool {
@@ -166,6 +177,121 @@ enum Audio {
         var size = UInt32(MemoryLayout<UInt32>.size)
         guard AudioObjectGetPropertyData(id, &a, 0, nil, &size, &v) == noErr else { return false }
         return v != 0
+    }
+}
+
+// MARK: - Output level
+
+/// Permission to record system audio, which the level meter needs. Uses the private TCC
+/// calls because there is no public API to check or ask for it.
+enum CapturePermission {
+    private static let service = "kTCCServiceAudioCapture" as CFString
+    private static let tcc = dlopen("/System/Library/PrivateFrameworks/TCC.framework/Versions/A/TCC", RTLD_NOW)
+
+    /// true = allowed, false = denied, nil = not asked yet (or unknown)
+    static var granted: Bool? {
+        typealias Preflight = @convention(c) (CFString, CFDictionary?) -> Int
+        guard let sym = dlsym(tcc, "TCCAccessPreflight") else { return nil }
+        switch unsafeBitCast(sym, to: Preflight.self)(service, nil) {
+        case 0: return true
+        case 1: return false
+        default: return nil
+        }
+    }
+    static func saveStatus() {
+        let s = granted.map { $0 ? "granted" : "denied" } ?? "unknown"
+        try? FileManager.default.createDirectory(at: supportURL, withIntermediateDirectories: true)
+        try? s.write(to: captureStatusURL, atomically: true, encoding: .utf8)
+    }
+}
+
+/// Listens to what a set of apps is sending to the output (through a private, unmuted process tap)
+/// and keeps the loudest sample since the last read. Tells sound from an app that only keeps the
+/// device open, such as a muted autoplay video or an idle DAW.
+@available(macOS 14.2, *)
+final class LevelMeter {
+    /// Peaks below this (about -70 dBFS) count as silence.
+    static let silence: Float = 0.0003
+
+    let processes: [AudioObjectID]
+    private var tap = AudioObjectID(kAudioObjectUnknown)
+    private var aggregate = AudioObjectID(kAudioObjectUnknown)
+    private var proc: AudioDeviceIOProcID?
+    private let box = Box()
+    let started = Date()
+    private final class Box { var peak: Float = 0 }   // written on the IO thread; a stale read is harmless
+
+    init?(processes: [AudioObjectID], device: AudioObjectID) {
+        self.processes = processes
+        let desc = CATapDescription(stereoMixdownOfProcesses: processes)
+        desc.isPrivate = true
+        desc.muteBehavior = .unmuted
+        guard AudioHardwareCreateProcessTap(desc, &tap) == noErr else { return nil }
+        var agg: [String: Any] = [
+            kAudioAggregateDeviceNameKey: "Audio Output Scheduler Meter",
+            kAudioAggregateDeviceUIDKey: UUID().uuidString,
+            kAudioAggregateDeviceIsPrivateKey: true,
+            kAudioAggregateDeviceIsStackedKey: false,
+            kAudioAggregateDeviceTapAutoStartKey: true,
+            kAudioAggregateDeviceTapListKey: [[kAudioSubTapUIDKey: desc.uuid.uuidString,
+                                               kAudioSubTapDriftCompensationKey: true]],
+        ]
+        if let uid = Audio.uid(device) {
+            agg[kAudioAggregateDeviceMainSubDeviceKey] = uid
+            agg[kAudioAggregateDeviceSubDeviceListKey] = [[kAudioSubDeviceUIDKey: uid]]
+        }
+        guard AudioHardwareCreateAggregateDevice(agg as CFDictionary, &aggregate) == noErr else { close(); return nil }
+        let box = box
+        let err = AudioDeviceCreateIOProcIDWithBlock(&proc, aggregate, nil) { _, input, _, _, _ in
+            var peak = box.peak
+            for buf in UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input)) {
+                guard let data = buf.mData else { continue }
+                let samples = data.assumingMemoryBound(to: Float.self)
+                for i in 0..<Int(buf.mDataByteSize) / MemoryLayout<Float>.size { peak = max(peak, abs(samples[i])) }
+            }
+            box.peak = peak
+        }
+        guard err == noErr, AudioDeviceStart(aggregate, proc) == noErr else { close(); return nil }
+    }
+    /// Loudest sample since the last call.
+    func readPeak() -> Float {
+        let p = box.peak
+        box.peak = 0
+        return p
+    }
+    private func close() {
+        if let proc {
+            AudioDeviceStop(aggregate, proc)
+            AudioDeviceDestroyIOProcID(aggregate, proc)
+        }
+        proc = nil
+        if aggregate != kAudioObjectUnknown { AudioHardwareDestroyAggregateDevice(aggregate) }
+        if tap != kAudioObjectUnknown { AudioHardwareDestroyProcessTap(tap) }
+        aggregate = kAudioObjectUnknown
+        tap = kAudioObjectUnknown
+    }
+    deinit { close() }
+}
+
+/// Decides whether something is really playing. With the system-audio permission it listens to the
+/// apps' output level; otherwise (or if the tap can't be made) any app with output running counts.
+final class PlaybackDetector {
+    private var meter: AnyObject?
+
+    func isPlaying(on dev: AudioObjectID, ignoring ignored: [String]) -> Bool {
+        let clients = Audio.activeClients(on: dev, ignoring: ignored)
+        guard !clients.isEmpty else { meter = nil; return false }
+        guard #available(macOS 14.2, *), CapturePermission.granted == true else { return true }
+        let procs = clients.map(\.object).sorted()
+        var m = meter as? LevelMeter
+        if m?.processes != procs {
+            m = LevelMeter(processes: procs, device: dev)
+            meter = m
+        }
+        guard let m else { return true }
+        // give a new tap a moment to deliver audio before trusting a silent reading
+        if Date().timeIntervalSince(m.started) < 0.5 { return true }
+        return m.readPeak() > LevelMeter.silence
     }
 }
 
